@@ -177,8 +177,8 @@ class BaseConfig(ArgsConfigTemplate):
     enable_onscreen: bool = True
     """Whether to enable onscreen rendering."""
 
-    upper_body_joint_speed: float = 1000
-    """Upper body joint speed."""
+    upper_body_joint_speed: float = 100
+    """Upper body joint speed (rad/s). Lower values improve balance stability during teleop."""
 
     env_name: str = "default"
     """Environment name."""
