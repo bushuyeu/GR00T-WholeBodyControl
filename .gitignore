@@ -173,3 +173,4 @@ MUJOCO_LOG.TXT
 # IsaacDeploy
 external_dependencies/isaac_teleop_app/isaac-deploy
 
+resources/poses/*.pkl
