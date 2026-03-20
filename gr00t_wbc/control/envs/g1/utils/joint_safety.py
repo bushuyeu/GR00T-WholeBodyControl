@@ -20,6 +20,7 @@ class JointSafetyMonitor:
     # Velocity limits in rad/s
     ARM_VELOCITY_LIMIT = 6.0  # rad/s for arm joints
     HAND_VELOCITY_LIMIT = 50.0  # rad/s for finger joints
+    POSITION_CRITICAL_MARGIN = 0.05  # 5% inward from URDF limits triggers hard kill
 
     def __init__(self, robot_model, enable_viz: bool = False, env_type: str = "real"):
         """Initialize joint safety monitor.
@@ -230,7 +231,7 @@ class JointSafetyMonitor:
                         self.violations.append(violation)
                         is_safe = False
 
-        # Check current joint positions (warning only - no shutdown)
+        # Check current joint positions - critical at 95% of URDF range
         if "q" in obs:
             joint_positions = obs["q"]
 
@@ -243,7 +244,13 @@ class JointSafetyMonitor:
                     position = joint_positions[i]
                     limits = self.position_limits[joint_name]
 
-                    if position < limits["min"] or position > limits["max"]:
+                    # Hard-kill thresholds: 5% inward from URDF limits
+                    pos_range = limits["max"] - limits["min"]
+                    hard_margin = pos_range * self.POSITION_CRITICAL_MARGIN
+                    hard_min = limits["min"] + hard_margin
+                    hard_max = limits["max"] - hard_margin
+
+                    if position < hard_min or position > hard_max:
                         violation = {
                             "joint": joint_name,
                             "type": "position",
@@ -253,10 +260,10 @@ class JointSafetyMonitor:
                             "exceeded_by": self._calculate_exceeded_percentage(
                                 position, limits["min"], limits["max"]
                             ),
-                            "critical": False,  # Position violations are warnings only
+                            "critical": True,
                         }
                         self.violations.append(violation)
-                        # Don't set is_safe = False for position violations
+                        is_safe = False
 
         return is_safe, self.violations
 

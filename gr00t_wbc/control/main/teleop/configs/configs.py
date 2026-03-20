@@ -177,8 +177,10 @@ class BaseConfig(ArgsConfigTemplate):
     enable_onscreen: bool = True
     """Whether to enable onscreen rendering."""
 
-    upper_body_joint_speed: float = 100
-    """Upper body joint speed (rad/s). Lower values improve balance stability during teleop."""
+    upper_body_joint_speed: float = 5.0
+    """Upper body joint speed limit (rad/s). Controls max velocity in InterpolationPolicy.
+    Must stay below ARM_VELOCITY_LIMIT (6.0 rad/s) in JointSafetyMonitor to avoid
+    hard shutdown on real hardware. Default 5.0 gives ~17% safety margin."""
 
     env_name: str = "default"
     """Environment name."""
