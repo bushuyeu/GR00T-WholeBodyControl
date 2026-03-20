@@ -386,7 +386,7 @@ class DefaultEnv:
         else:
             self.mj_data.ctrl = self.torques
         mujoco.mj_step(self.mj_model, self.mj_data)
-        # self.check_self_collision()
+        self.check_self_collision()
 
     def kinematics_step(self):
         """

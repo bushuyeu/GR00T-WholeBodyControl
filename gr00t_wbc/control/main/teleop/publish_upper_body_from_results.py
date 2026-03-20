@@ -39,6 +39,7 @@ import time
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
+from scipy.ndimage import gaussian_filter1d
 
 from gr00t_wbc.control.main.constants import (
     CONTROL_GOAL_TOPIC,
@@ -180,11 +181,19 @@ def main():
                     help="Only publish upper body poses, do NOT publish navigate_cmd or "
                          "base_height_command. This allows the control loop's RL policy "
                          "to handle leg locomotion independently.")
+    ap.add_argument("--smooth", type=float, default=0.0, metavar="SIGMA",
+                    help="Gaussian smoothing sigma (in frames). Removes jitter from noisy "
+                         "pose estimates. Try 2.0-5.0. 0 = no smoothing (default).")
     args = ap.parse_args()
 
     results = load_results(args.results)
     fps = float(results["fps"])
     dof_pos = results["dof_pos"]
+
+    if args.smooth > 0:
+        dof_pos = gaussian_filter1d(dof_pos, sigma=args.smooth, axis=0)
+        print(f"[info] applied Gaussian smoothing (sigma={args.smooth:.1f} frames)")
+
     T, ndof = dof_pos.shape
 
     src_dof_names = load_dof_names_override(args.dof_names_json)
