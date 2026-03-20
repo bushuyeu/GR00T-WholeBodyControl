@@ -125,6 +125,64 @@ DEFAULT_DOF_NAMES_29 = [
 ]
 
 
+# Joint position limits from Unitree G1 29-DOF URDF (rad)
+# Source: https://github.com/unitreerobotics/unitree_ros/blob/master/robots/g1_description/g1_29dof.urdf
+JOINT_POSITION_LIMITS = {
+    # left leg
+    "left_hip_pitch_joint": (-2.5307, 2.8798),
+    "left_hip_roll_joint": (-0.5236, 2.9671),
+    "left_hip_yaw_joint": (-2.7576, 2.7576),
+    "left_knee_joint": (-0.087267, 2.8798),
+    "left_ankle_pitch_joint": (-0.87267, 0.5236),
+    "left_ankle_roll_joint": (-0.2618, 0.2618),
+    # right leg
+    "right_hip_pitch_joint": (-2.5307, 2.8798),
+    "right_hip_roll_joint": (-2.9671, 0.5236),
+    "right_hip_yaw_joint": (-2.7576, 2.7576),
+    "right_knee_joint": (-0.087267, 2.8798),
+    "right_ankle_pitch_joint": (-0.87267, 0.5236),
+    "right_ankle_roll_joint": (-0.2618, 0.2618),
+    # waist
+    "waist_yaw_joint": (-2.618, 2.618),
+    "waist_roll_joint": (-0.52, 0.52),
+    "waist_pitch_joint": (-0.52, 0.52),
+    # left arm
+    "left_shoulder_pitch_joint": (-3.0892, 2.6704),
+    "left_shoulder_roll_joint": (-1.5882, 2.2515),
+    "left_shoulder_yaw_joint": (-2.618, 2.618),
+    "left_elbow_joint": (-1.0472, 2.0944),
+    "left_wrist_roll_joint": (-1.972222054, 1.972222054),
+    "left_wrist_pitch_joint": (-1.61443, 1.61443),
+    "left_wrist_yaw_joint": (-1.61443, 1.61443),
+    # right arm
+    "right_shoulder_pitch_joint": (-3.0892, 2.6704),
+    "right_shoulder_roll_joint": (-2.2515, 1.5882),
+    "right_shoulder_yaw_joint": (-2.618, 2.618),
+    "right_elbow_joint": (-1.0472, 2.0944),
+    "right_wrist_roll_joint": (-1.972222054, 1.972222054),
+    "right_wrist_pitch_joint": (-1.61443, 1.61443),
+    "right_wrist_yaw_joint": (-1.61443, 1.61443),
+}
+
+# 5% inward margin (matches POSITION_CRITICAL_MARGIN in joint_safety.py)
+POSITION_CLAMP_MARGIN = 0.05
+
+
+def clamp_to_joint_limits(dof_pos: np.ndarray, dof_names: list, margin: float = POSITION_CLAMP_MARGIN) -> int:
+    """Clamp joint positions to safe range (URDF limits with inward margin). Returns count of clamped values."""
+    clamped = 0
+    for i, name in enumerate(dof_names):
+        if name in JOINT_POSITION_LIMITS:
+            lo, hi = JOINT_POSITION_LIMITS[name]
+            rng = hi - lo
+            safe_lo = lo + rng * margin
+            safe_hi = hi - rng * margin
+            out_of_range = np.sum((dof_pos[:, i] < safe_lo) | (dof_pos[:, i] > safe_hi))
+            clamped += out_of_range
+            dof_pos[:, i] = np.clip(dof_pos[:, i], safe_lo, safe_hi)
+    return clamped
+
+
 def load_results(path: str) -> Dict:
     with open(path, "rb") as f:
         obj = pickle.load(f)
@@ -193,6 +251,20 @@ def main():
     if args.smooth > 0:
         dof_pos = gaussian_filter1d(dof_pos, sigma=args.smooth, axis=0)
         print(f"[info] applied Gaussian smoothing (sigma={args.smooth:.1f} frames)")
+
+    # Need dof_names before clamping
+    src_dof_names_early = None
+    if isinstance(results.get("dof_names", None), list) and len(results["dof_names"]) == dof_pos.shape[1]:
+        src_dof_names_early = list(results["dof_names"])
+    elif dof_pos.shape[1] == len(DEFAULT_DOF_NAMES_29):
+        src_dof_names_early = DEFAULT_DOF_NAMES_29
+
+    if src_dof_names_early:
+        clamped = clamp_to_joint_limits(dof_pos, src_dof_names_early)
+        if clamped > 0:
+            print(f"[info] clamped {clamped} out-of-range joint values to 95% of URDF limits")
+    else:
+        print("[warn] could not resolve dof_names for clamping — skipping position clamp")
 
     T, ndof = dof_pos.shape
 
