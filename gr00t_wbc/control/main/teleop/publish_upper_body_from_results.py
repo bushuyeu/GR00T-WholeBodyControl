@@ -265,25 +265,53 @@ def remove_self_collisions(dof_pos: np.ndarray, dof_names: list,
         for dof_i, qpos_addr in joint_map.items():
             data.qpos[qpos_addr] = pose[dof_i]
 
+    # Pass 1: blend collision frames toward LAST SAFE frame (not neutral)
+    # for temporal continuity — avoids choppy jumps to zero.
+    last_safe = neutral.copy()
     adjusted = 0
     for frame_idx in range(len(dof_pos)):
         _set_pose(dof_pos[frame_idx])
         if not _has_self_collision():
+            last_safe = dof_pos[frame_idx].copy()
             continue
 
-        # Binary search: find minimum blend toward neutral that clears collision
         lo, hi = 0.0, 1.0
         for _ in range(12):
             alpha = (lo + hi) / 2
-            blended = dof_pos[frame_idx] * (1 - alpha) + neutral * alpha
+            blended = dof_pos[frame_idx] * (1 - alpha) + last_safe * alpha
             _set_pose(blended)
             if _has_self_collision():
                 lo = alpha
             else:
                 hi = alpha
 
-        dof_pos[frame_idx] = dof_pos[frame_idx] * (1 - hi) + neutral * hi
+        dof_pos[frame_idx] = dof_pos[frame_idx] * (1 - hi) + last_safe * hi
         adjusted += 1
+
+    # Pass 2: smooth the adjusted trajectory to remove jitter, then
+    # re-check for collisions introduced by smoothing.
+    if adjusted > 0:
+        dof_pos[:] = gaussian_filter1d(dof_pos, sigma=2.0, axis=0)
+        refix = 0
+        last_safe = neutral.copy()
+        for frame_idx in range(len(dof_pos)):
+            _set_pose(dof_pos[frame_idx])
+            if not _has_self_collision():
+                last_safe = dof_pos[frame_idx].copy()
+                continue
+            lo, hi = 0.0, 1.0
+            for _ in range(12):
+                alpha = (lo + hi) / 2
+                blended = dof_pos[frame_idx] * (1 - alpha) + last_safe * alpha
+                _set_pose(blended)
+                if _has_self_collision():
+                    lo = alpha
+                else:
+                    hi = alpha
+            dof_pos[frame_idx] = dof_pos[frame_idx] * (1 - hi) + last_safe * hi
+            refix += 1
+        if refix > 0:
+            print(f"[info] pass 2: re-fixed {refix} frames after smoothing")
 
     return adjusted
 
