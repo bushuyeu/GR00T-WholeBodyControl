@@ -36,10 +36,15 @@ import argparse
 import json
 import pickle
 import time
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 import numpy as np
 from scipy.ndimage import gaussian_filter1d
+
+# Path to g1.xml for MuJoCo collision checking
+_PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent.parent.parent
+_G1_XML_PATH = _PROJECT_ROOT / "gr00t_wbc" / "sim2mujoco" / "resources" / "robots" / "g1" / "g1.xml"
 
 from gr00t_wbc.control.main.constants import (
     CONTROL_GOAL_TOPIC,
@@ -194,6 +199,95 @@ def clamp_to_joint_limits(dof_pos: np.ndarray, dof_names: list, margin: float = 
     return clamped
 
 
+def remove_self_collisions(dof_pos: np.ndarray, dof_names: list,
+                           model_xml: str = str(_G1_XML_PATH)) -> int:
+    """Remove self-collisions by blending frames toward neutral pose.
+
+    For each frame that causes self-collision in MuJoCo, binary-search
+    the minimum blend toward neutral (zero) that eliminates all contacts.
+    Returns count of adjusted frames.
+    """
+    import mujoco
+    import re
+    import tempfile
+
+    # Load XML and strip terrain/floor/groundplane (may reference missing mesh files).
+    # Pass the model directory so MuJoCo can resolve relative mesh paths.
+    model_dir = str(Path(model_xml).parent)
+    xml_text = Path(model_xml).read_text()
+    # Remove all non-robot elements (terrain, floor, groundplane) that may
+    # reference missing mesh files. We only need the robot for collision checking.
+    xml_text = '\n'.join(
+        line for line in xml_text.split('\n')
+        if not any(kw in line for kw in ['terrain_mesh', 'groundplane', 'name="floor"'])
+    )
+    xml_text = re.sub(r'<body\s+name="terrain_body"[^>]*>.*?</body>', '', xml_text, flags=re.DOTALL)
+
+    # Rewrite meshdir to absolute path so from_xml_string can find STLs
+    xml_text = xml_text.replace('meshdir="meshes"', f'meshdir="{model_dir}/meshes"')
+    model = mujoco.MjModel.from_xml_string(xml_text)
+    data = mujoco.MjData(model)
+
+    # Map dof names to qpos addresses
+    joint_map = {}  # dof_index -> qpos_address
+    for i, name in enumerate(dof_names):
+        jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, name)
+        if jid >= 0:
+            joint_map[i] = model.jnt_qposadr[jid]
+
+    # Robot body IDs (descendants of pelvis) for self-collision filtering
+    pelvis_id = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_BODY, "pelvis")
+    robot_body_ids = set()
+    for bid in range(model.nbody):
+        parent = bid
+        while parent > 0:
+            if parent == pelvis_id:
+                robot_body_ids.add(bid)
+                break
+            parent = model.body_parentid[parent]
+    robot_body_ids.add(pelvis_id)
+
+    neutral = np.zeros(len(dof_names))
+
+    def _has_self_collision() -> bool:
+        mujoco.mj_forward(model, data)
+        for ci in range(data.ncon):
+            c = data.contact[ci]
+            b1 = model.geom_bodyid[c.geom1]
+            b2 = model.geom_bodyid[c.geom2]
+            if b1 in robot_body_ids and b2 in robot_body_ids:
+                return True
+        return False
+
+    def _set_pose(pose: np.ndarray):
+        mujoco.mj_resetData(model, data)
+        data.qpos[2] = 0.793  # pelvis standing height
+        for dof_i, qpos_addr in joint_map.items():
+            data.qpos[qpos_addr] = pose[dof_i]
+
+    adjusted = 0
+    for frame_idx in range(len(dof_pos)):
+        _set_pose(dof_pos[frame_idx])
+        if not _has_self_collision():
+            continue
+
+        # Binary search: find minimum blend toward neutral that clears collision
+        lo, hi = 0.0, 1.0
+        for _ in range(12):
+            alpha = (lo + hi) / 2
+            blended = dof_pos[frame_idx] * (1 - alpha) + neutral * alpha
+            _set_pose(blended)
+            if _has_self_collision():
+                lo = alpha
+            else:
+                hi = alpha
+
+        dof_pos[frame_idx] = dof_pos[frame_idx] * (1 - hi) + neutral * hi
+        adjusted += 1
+
+    return adjusted
+
+
 def load_results(path: str) -> Dict:
     with open(path, "rb") as f:
         obj = pickle.load(f)
@@ -253,6 +347,10 @@ def main():
     ap.add_argument("--smooth", type=float, default=0.0, metavar="SIGMA",
                     help="Gaussian smoothing sigma (in frames). Removes jitter from noisy "
                          "pose estimates. Try 2.0-5.0. 0 = no smoothing (default).")
+    ap.add_argument("--collision-free", action="store_true",
+                    help="Post-process trajectory to remove ALL self-collisions using "
+                         "MuJoCo collision detection. Frames with self-contact are blended "
+                         "toward neutral pose until collision-free.")
     args = ap.parse_args()
 
     results = load_results(args.results)
@@ -276,6 +374,14 @@ def main():
             print(f"[info] clamped {clamped} out-of-range joint values to 95% of URDF limits")
     else:
         print("[warn] could not resolve dof_names for clamping — skipping position clamp")
+
+    if args.collision_free and src_dof_names_early:
+        print("[info] running collision-free post-processing (MuJoCo)...")
+        adjusted = remove_self_collisions(dof_pos, src_dof_names_early)
+        if adjusted > 0:
+            print(f"[info] adjusted {adjusted}/{len(dof_pos)} frames to remove self-collisions")
+        else:
+            print("[info] no self-collisions found — trajectory is clean")
 
     T, ndof = dof_pos.shape
 
