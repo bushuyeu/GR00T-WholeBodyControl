@@ -167,13 +167,24 @@ JOINT_POSITION_LIMITS = {
 # 5% inward margin (matches POSITION_CRITICAL_MARGIN in joint_safety.py)
 POSITION_CLAMP_MARGIN = 0.05
 
+# Tighter limits to prevent arm-torso self-collision.
+# URDF limits define the full mechanical range, but certain shoulder poses
+# cause the arm to contact the torso. These overrides restrict adduction
+# (arm moving inward toward body) to a safe range.
+# Left roll negative = adduction; right roll positive = adduction (mirrored).
+SELF_COLLISION_SAFE_LIMITS = {
+    "left_shoulder_roll_joint": (-0.75, 2.2515),   # restrict adduction from -1.59 to -0.75 rad
+    "right_shoulder_roll_joint": (-2.2515, 0.75),   # restrict adduction from  1.59 to  0.75 rad
+}
+
 
 def clamp_to_joint_limits(dof_pos: np.ndarray, dof_names: list, margin: float = POSITION_CLAMP_MARGIN) -> int:
     """Clamp joint positions to safe range (URDF limits with inward margin). Returns count of clamped values."""
     clamped = 0
     for i, name in enumerate(dof_names):
         if name in JOINT_POSITION_LIMITS:
-            lo, hi = JOINT_POSITION_LIMITS[name]
+            # Use self-collision-safe limits when available, else URDF limits
+            lo, hi = SELF_COLLISION_SAFE_LIMITS.get(name, JOINT_POSITION_LIMITS[name])
             rng = hi - lo
             safe_lo = lo + rng * margin
             safe_hi = hi - rng * margin
