@@ -535,14 +535,25 @@ class DefaultEnv:
         if self.fall:
             self.reset()
 
+    _last_collision_log_time: float = 0.0
+
     def check_self_collision(self):
-        """Check for self-collision of the robot"""
+        """Check for self-collision of the robot.
+
+        Rate-limits warnings to once per second to keep the terminal readable.
+        All contacts are still detected and returned — only the print is throttled.
+        """
+        import time
+
         robot_bodies = get_subtree_body_names(self.mj_model, self.mj_model.body(self.root_body).id)
         self_collision, contact_bodies = check_contact(
             self.mj_model, self.mj_data, robot_bodies, robot_bodies, return_all_contact_bodies=True
         )
         if self_collision:
-            print(f"Warning: Self-collision detected: {contact_bodies}")
+            now = time.monotonic()
+            if now - self._last_collision_log_time >= 1.0:
+                self._last_collision_log_time = now
+                print(f"Warning: Self-collision detected: {contact_bodies}")
         return self_collision
 
     def reset(self):
