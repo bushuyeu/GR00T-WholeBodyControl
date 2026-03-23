@@ -536,13 +536,24 @@ class DefaultEnv:
             self.reset()
 
     _last_collision_log_time: float = 0.0
+    _collision_log_file = None
+
+    COLLISION_LOG_PATH = "/tmp/gr00t_collision_log.jsonl"
+
+    def _ensure_collision_log(self):
+        if self._collision_log_file is None:
+            import json as _json
+            self._collision_log_file = open(self.COLLISION_LOG_PATH, 'w')
+            print(f"[info] collision log: {self.COLLISION_LOG_PATH}")
 
     def check_self_collision(self):
         """Check for self-collision of the robot.
 
-        Rate-limits warnings to once per second to keep the terminal readable.
-        All contacts are still detected and returned — only the print is throttled.
+        Rate-limits terminal warnings to once per second.
+        Logs EVERY collision event to /tmp/gr00t_collision_log.jsonl for
+        two-pass collision removal (publisher --fix-from-log).
         """
+        import json as _json
         import time
 
         robot_bodies = get_subtree_body_names(self.mj_model, self.mj_model.body(self.root_body).id)
@@ -550,10 +561,18 @@ class DefaultEnv:
             self.mj_model, self.mj_data, robot_bodies, robot_bodies, return_all_contact_bodies=True
         )
         if self_collision:
-            now = time.monotonic()
+            now = time.time()
+            # Rate-limited terminal warning
             if now - self._last_collision_log_time >= 1.0:
                 self._last_collision_log_time = now
                 print(f"Warning: Self-collision detected: {contact_bodies}")
+            # Log every event to file for two-pass fix
+            self._ensure_collision_log()
+            self._collision_log_file.write(_json.dumps({
+                "t": round(now, 4),
+                "pairs": [list(p) for p in contact_bodies]
+            }) + '\n')
+            self._collision_log_file.flush()
         return self_collision
 
     def reset(self):

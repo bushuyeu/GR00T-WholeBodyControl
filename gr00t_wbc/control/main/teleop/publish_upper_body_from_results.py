@@ -223,7 +223,7 @@ def remove_self_collisions(dof_pos: np.ndarray, dof_names: list,
     )
     xml_text = re.sub(r'<body\s+name="terrain_body"[^>]*>.*?</body>', '', xml_text, flags=re.DOTALL)
 
-    # Rewrite meshdir to absolute path so from_xml_string can find STLs
+    # Rewrite meshdir to absolute path so from_xml_string can find STLs.
     xml_text = xml_text.replace('meshdir="meshes"', f'meshdir="{model_dir}/meshes"')
     model = mujoco.MjModel.from_xml_string(xml_text)
     data = mujoco.MjData(model)
@@ -249,15 +249,22 @@ def remove_self_collisions(dof_pos: np.ndarray, dof_names: list,
 
     neutral = np.zeros(len(dof_names))
 
-    def _has_self_collision() -> bool:
+    def _get_self_collisions() -> list:
+        """Return list of colliding body-name pairs, or empty list if clean."""
         mujoco.mj_forward(model, data)
+        pairs = []
         for ci in range(data.ncon):
             c = data.contact[ci]
             b1 = model.geom_bodyid[c.geom1]
             b2 = model.geom_bodyid[c.geom2]
             if b1 in robot_body_ids and b2 in robot_body_ids:
-                return True
-        return False
+                n1 = model.body(b1).name
+                n2 = model.body(b2).name
+                pairs.append((n1, n2))
+        return pairs
+
+    def _has_self_collision() -> bool:
+        return len(_get_self_collisions()) > 0
 
     def _set_pose(pose: np.ndarray):
         mujoco.mj_resetData(model, data)
@@ -265,40 +272,26 @@ def remove_self_collisions(dof_pos: np.ndarray, dof_names: list,
         for dof_i, qpos_addr in joint_map.items():
             data.qpos[qpos_addr] = pose[dof_i]
 
-    # Pass 1: blend collision frames toward LAST SAFE frame (not neutral)
-    # for temporal continuity — avoids choppy jumps to zero.
-    last_safe = neutral.copy()
-    adjusted = 0
-    for frame_idx in range(len(dof_pos)):
-        _set_pose(dof_pos[frame_idx])
-        if not _has_self_collision():
-            last_safe = dof_pos[frame_idx].copy()
-            continue
+    T = len(dof_pos)
+    collision_pairs_seen: dict = {}  # pair -> count
 
-        lo, hi = 0.0, 1.0
-        for _ in range(12):
-            alpha = (lo + hi) / 2
-            blended = dof_pos[frame_idx] * (1 - alpha) + last_safe * alpha
-            _set_pose(blended)
-            if _has_self_collision():
-                lo = alpha
-            else:
-                hi = alpha
-
-        dof_pos[frame_idx] = dof_pos[frame_idx] * (1 - hi) + last_safe * hi
-        adjusted += 1
-
-    # Pass 2: smooth the adjusted trajectory to remove jitter, then
-    # re-check for collisions introduced by smoothing.
-    if adjusted > 0:
-        dof_pos[:] = gaussian_filter1d(dof_pos, sigma=2.0, axis=0)
-        refix = 0
+    def _run_pass(pass_name: str) -> int:
+        nonlocal collision_pairs_seen
         last_safe = neutral.copy()
-        for frame_idx in range(len(dof_pos)):
+        fixed = 0
+        for frame_idx in range(T):
+            if frame_idx % 2000 == 0:
+                print(f"  [{pass_name}] checking frame {frame_idx}/{T}...", flush=True)
             _set_pose(dof_pos[frame_idx])
-            if not _has_self_collision():
+            collisions = _get_self_collisions()
+            if not collisions:
                 last_safe = dof_pos[frame_idx].copy()
                 continue
+
+            for pair in collisions:
+                key = tuple(sorted(pair))
+                collision_pairs_seen[key] = collision_pairs_seen.get(key, 0) + 1
+
             lo, hi = 0.0, 1.0
             for _ in range(12):
                 alpha = (lo + hi) / 2
@@ -308,12 +301,123 @@ def remove_self_collisions(dof_pos: np.ndarray, dof_names: list,
                     lo = alpha
                 else:
                     hi = alpha
+
             dof_pos[frame_idx] = dof_pos[frame_idx] * (1 - hi) + last_safe * hi
-            refix += 1
-        if refix > 0:
-            print(f"[info] pass 2: re-fixed {refix} frames after smoothing")
+            fixed += 1
+        return fixed
+
+    # Pass 1: fix collision frames by blending toward last safe frame
+    adjusted = _run_pass("pass 1")
+    print(f"  [pass 1] fixed {adjusted}/{T} frames")
+
+    # Pass 2: smooth then re-check
+    if adjusted > 0:
+        dof_pos[:] = gaussian_filter1d(dof_pos, sigma=2.0, axis=0)
+        print(f"  [pass 2] applied smoothing (sigma=2.0), re-checking...")
+        refix = _run_pass("pass 2")
+        print(f"  [pass 2] re-fixed {refix}/{T} frames after smoothing")
+
+    # Report which body pairs had collisions
+    if collision_pairs_seen:
+        print(f"  collision pairs found:")
+        for pair, count in sorted(collision_pairs_seen.items(), key=lambda x: -x[1]):
+            print(f"    {pair[0]} ↔ {pair[1]}: {count} frames")
 
     return adjusted
+
+
+COLLISION_LOG_PATH = "/tmp/gr00t_collision_log.jsonl"
+
+
+def fix_from_collision_log(dof_pos: np.ndarray, fps: float, speed: float,
+                           t0_wall: float, initial_pose_seconds: float,
+                           log_path: str = COLLISION_LOG_PATH,
+                           window: int = 15) -> int:
+    """Fix trajectory frames that caused collisions during a sim run.
+
+    Reads collision timestamps from the sim's log, maps them to trajectory
+    frame indices, and smoothly blends those frames (± window) toward the
+    nearest safe neighbors.
+
+    Returns count of frames fixed.
+    """
+    import json
+
+    if not Path(log_path).exists():
+        print(f"[warn] no collision log found at {log_path}")
+        return 0
+
+    # Read collision events
+    events = []
+    with open(log_path) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                events.append(json.loads(line))
+
+    if not events:
+        print("[info] collision log is empty — no collisions detected in pass 1")
+        return 0
+
+    # Map wall-clock times to frame indices
+    # Motion starts at t0_wall + initial_pose_seconds
+    t_motion_start = t0_wall + initial_pose_seconds
+    T = len(dof_pos)
+
+    collision_frames = set()
+    for ev in events:
+        t_wall = ev["t"]
+        t_motion = (t_wall - t_motion_start) * speed
+        if t_motion < 0:
+            continue  # collision during initial settle — skip
+        frame_idx = int(round(t_motion * fps))
+        # Add frame ± window
+        for f in range(max(0, frame_idx - window), min(T, frame_idx + window + 1)):
+            collision_frames.add(f)
+
+    if not collision_frames:
+        print("[info] no collision frames mapped from log")
+        return 0
+
+    # Report collision pairs from log
+    pair_counts: dict = {}
+    for ev in events:
+        for pair in ev.get("pairs", []):
+            key = tuple(sorted(pair))
+            pair_counts[key] = pair_counts.get(key, 0) + 1
+
+    print(f"[info] collision log: {len(events)} events, {len(collision_frames)} frames to fix (±{window} window)")
+    for pair, count in sorted(pair_counts.items(), key=lambda x: -x[1]):
+        print(f"    {pair[0]} ↔ {pair[1]}: {count} events")
+
+    # Fix collision frames by blending toward nearest safe neighbor
+    sorted_frames = sorted(collision_frames)
+    fixed = 0
+    for frame_idx in sorted_frames:
+        # Find nearest non-collision frame before and after
+        before = frame_idx - 1
+        while before >= 0 and before in collision_frames:
+            before -= 1
+        after = frame_idx + 1
+        while after < T and after in collision_frames:
+            after += 1
+
+        if before >= 0 and after < T:
+            # Blend between before and after
+            span = after - before
+            alpha = (frame_idx - before) / span
+            dof_pos[frame_idx] = (1 - alpha) * dof_pos[before] + alpha * dof_pos[after]
+        elif before >= 0:
+            dof_pos[frame_idx] = dof_pos[before].copy()
+        elif after < T:
+            dof_pos[frame_idx] = dof_pos[after].copy()
+        fixed += 1
+
+    # Smooth the fixed region to avoid discontinuities
+    dof_pos[:] = gaussian_filter1d(dof_pos, sigma=3.0, axis=0)
+    print(f"[info] fixed {fixed} frames, applied smoothing (sigma=3.0)")
+
+    return fixed
 
 
 def load_results(path: str) -> Dict:
@@ -379,6 +483,10 @@ def main():
                     help="Post-process trajectory to remove ALL self-collisions using "
                          "MuJoCo collision detection. Frames with self-contact are blended "
                          "toward neutral pose until collision-free.")
+    ap.add_argument("--two-pass", action="store_true",
+                    help="Two-pass collision removal. Pass 1: play trajectory once (no loop) "
+                         "while the sim logs collisions to /tmp/gr00t_collision_log.jsonl. "
+                         "Pass 2: fix the logged collision frames, then loop.")
     args = ap.parse_args()
 
     results = load_results(args.results)
@@ -404,6 +512,18 @@ def main():
         print("[warn] could not resolve dof_names for clamping — skipping position clamp")
 
     if args.collision_free and src_dof_names_early:
+        # Upsample 4x before collision check so interpolated midpoints are also validated.
+        # Without this, linear interpolation between safe keyframes can pass through
+        # collision space (e.g., hands crossing paths between two safe poses).
+        from scipy.interpolate import interp1d
+        T_orig = len(dof_pos)
+        upsample = 8
+        x_orig = np.linspace(0, 1, T_orig)
+        x_up = np.linspace(0, 1, T_orig * upsample)
+        dof_pos = interp1d(x_orig, dof_pos, axis=0, kind='linear')(x_up)
+        fps = fps * upsample
+        print(f"[info] upsampled {T_orig} → {len(dof_pos)} frames for collision checking")
+
         print("[info] running collision-free post-processing (MuJoCo)...")
         adjusted = remove_self_collisions(dof_pos, src_dof_names_early)
         if adjusted > 0:
@@ -448,65 +568,102 @@ def main():
     pub = ROSMsgPublisher(CONTROL_GOAL_TOPIC)
     rate = node.create_rate(args.teleop_frequency)
 
-    # State for hold mode
-    last_upper = np.zeros((28,), dtype=float)
+    def _play_once(label: str, do_loop: bool) -> float:
+        """Play through the trajectory. Returns wall-clock start time."""
+        last_upper = np.zeros((28,), dtype=float)
+        iteration = 0
+        t0_wall = time.time()
 
-    iteration = 0
-    t0_wall = time.monotonic()
+        try:
+            while ros_manager.ok():
+                t_now = time.time()
+                t_motion = (t_now - t0_wall) * float(args.speed)
+
+                if t_motion >= duration:
+                    if do_loop:
+                        t0_wall = t_now
+                        t_motion = 0.0
+                        iteration = 0
+                    else:
+                        print(f"[info] {label}: reached end of motion")
+                        break
+
+                q_src = interp_dof_pos(dof_pos, fps=fps, t=t_motion)
+
+                q_upper = np.empty((28,), dtype=float)
+                for i, jn in enumerate(UPPER_BODY_NAMES_28):
+                    if jn in name_to_col:
+                        q_upper[i] = float(q_src[name_to_col[jn]])
+                    else:
+                        q_upper[i] = 0.0 if args.hand_mode == "zero" else float(last_upper[i])
+
+                last_upper = q_upper.copy()
+
+                if iteration == 0:
+                    target_time = t_now + float(args.initial_pose_seconds)
+                else:
+                    target_time = t_now + (1.0 / float(args.teleop_frequency))
+
+                msg = {
+                    "timestamp": t_now,
+                    "target_time": target_time,
+                    "target_upper_body_pose": q_upper,
+                }
+
+                if not args.upper_body_only:
+                    msg["navigate_cmd"] = np.asarray(DEFAULT_NAV_CMD, dtype=float)
+                    msg["base_height_command"] = float(DEFAULT_BASE_HEIGHT)
+
+                pub.publish(msg)
+
+                if iteration == 0:
+                    mode_str = "upper-body-only" if args.upper_body_only else "full"
+                    print(f"[info] {label}: sent initial waypoint ({mode_str}). "
+                          f"settle {args.initial_pose_seconds:.2f}s")
+                    time.sleep(float(args.initial_pose_seconds))
+
+                iteration += 1
+                rate.sleep()
+
+        except ros_manager.exceptions() as e:
+            print(f"[info] {label}: interrupted: {e}")
+
+        return t0_wall
 
     try:
-        while ros_manager.ok():
-            t_now = time.monotonic()
-            t_motion = (t_now - t0_wall) * float(args.speed)
+        if args.two_pass:
+            # Clear old collision log
+            log_path = COLLISION_LOG_PATH
+            if Path(log_path).exists():
+                Path(log_path).unlink()
 
-            if t_motion >= duration:
-                if args.loop:
-                    t0_wall = t_now
-                    t_motion = 0.0
-                    iteration = 0
-                else:
-                    print("[info] reached end of motion; stopping")
-                    break
+            # Pass 1: play once, let sim record collisions
+            print("=" * 50)
+            print("[PASS 1] Playing trajectory once — sim is recording collisions...")
+            print(f"[PASS 1] Press ] in Terminal 1 to activate, wait 5s, press 9")
+            print("=" * 50)
+            t0 = _play_once("pass 1", do_loop=False)
 
-            q_src = interp_dof_pos(dof_pos, fps=fps, t=t_motion)
+            # Read collision log and fix
+            print("=" * 50)
+            print("[FIX] Reading collision log and fixing trajectory...")
+            print("=" * 50)
+            fixed = fix_from_collision_log(
+                dof_pos, fps=fps, speed=float(args.speed),
+                t0_wall=t0, initial_pose_seconds=float(args.initial_pose_seconds),
+            )
+            if fixed > 0:
+                # Re-clamp after smoothing
+                if src_dof_names_early:
+                    clamp_to_joint_limits(dof_pos, src_dof_names_early)
 
-            # Build q_upper in EXACT expected order
-            q_upper = np.empty((28,), dtype=float)
-            for i, jn in enumerate(UPPER_BODY_NAMES_28):
-                if jn in name_to_col:
-                    q_upper[i] = float(q_src[name_to_col[jn]])
-                else:
-                    q_upper[i] = 0.0 if args.hand_mode == "zero" else float(last_upper[i])
-
-            last_upper = q_upper.copy()
-
-            # target_time: longer on first send so interpolation_policy has time to move safely
-            if iteration == 0:
-                target_time = t_now + float(args.initial_pose_seconds)
-            else:
-                target_time = t_now + (1.0 / float(args.teleop_frequency))
-
-            msg = {
-                "timestamp": t_now,
-                "target_time": target_time,
-                "target_upper_body_pose": q_upper,                         # (28,)
-            }
-
-            # Only include lower body commands if not in upper-body-only mode
-            if not args.upper_body_only:
-                msg["navigate_cmd"] = np.asarray(DEFAULT_NAV_CMD, dtype=float)  # (3,)
-                msg["base_height_command"] = float(DEFAULT_BASE_HEIGHT)         # scalar
-
-            pub.publish(msg)
-
-            if iteration == 0:
-                mode_str = "upper-body-only" if args.upper_body_only else "full (upper=28, nav=3, base=1)"
-                print(f"[info] sent initial waypoint ({mode_str}). "
-                      f"settle {args.initial_pose_seconds:.2f}s")
-                time.sleep(float(args.initial_pose_seconds))
-
-            iteration += 1
-            rate.sleep()
+            # Pass 2: loop with fixed trajectory
+            print("=" * 50)
+            print(f"[PASS 2] Playing fixed trajectory (loop={args.loop})...")
+            print("=" * 50)
+            _play_once("pass 2", do_loop=args.loop)
+        else:
+            _play_once("play", do_loop=args.loop)
 
     except ros_manager.exceptions() as e:
         print(f"[info] ROSManager interrupted: {e}")
