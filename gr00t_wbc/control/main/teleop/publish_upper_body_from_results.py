@@ -483,10 +483,10 @@ def main():
                     help="Post-process trajectory to remove ALL self-collisions using "
                          "MuJoCo collision detection. Frames with self-contact are blended "
                          "toward neutral pose until collision-free.")
-    ap.add_argument("--two-pass", action="store_true",
-                    help="Two-pass collision removal. Pass 1: play trajectory once (no loop) "
-                         "while the sim logs collisions to /tmp/gr00t_collision_log.jsonl. "
-                         "Pass 2: fix the logged collision frames, then loop.")
+    ap.add_argument("--two-pass", type=int, nargs='?', const=3, default=0, metavar="N",
+                    help="N-pass collision removal. Iterates: play once, fix collisions from "
+                         "sim log, repeat until N consecutive clean passes, then loop. "
+                         "Default N=3 if flag given without value. 0 = disabled.")
     args = ap.parse_args()
 
     results = load_results(args.results)
@@ -649,34 +649,63 @@ def main():
     try:
         if args.two_pass:
             log_path = COLLISION_LOG_PATH
-            # Don't delete or truncate — sim may have the file open.
-            # We filter by timestamp in fix_from_collision_log instead.
+            CLEAN_PASSES_REQUIRED = args.two_pass
+            clean_passes = 0
+            pass_num = 0
+            hardware_safe = False
 
-            # Pass 1: play once, let sim record collisions
-            print("=" * 50)
-            print("[PASS 1] Playing trajectory once — sim is recording collisions...")
-            print(f"[PASS 1] Press ] in Terminal 1 to activate, wait 5s, press 9")
-            print("=" * 50)
-            t0 = _play_once("pass 1", do_loop=False)
+            while ros_manager.ok():
+                pass_num += 1
+                label = f"pass {pass_num}"
 
-            # Read collision log and fix
-            print("=" * 50)
-            print("[FIX] Reading collision log and fixing trajectory...")
-            print("=" * 50)
-            fixed = fix_from_collision_log(
-                dof_pos, fps=fps, speed=float(args.speed),
-                t0_wall=t0, initial_pose_seconds=float(args.initial_pose_seconds),
-            )
-            if fixed > 0:
-                # Re-clamp after smoothing
-                if src_dof_names_early:
-                    clamp_to_joint_limits(dof_pos, src_dof_names_early)
+                if pass_num == 1:
+                    print("=" * 60)
+                    print(f"[PASS {pass_num}] Playing trajectory — sim is recording collisions...")
+                    print(f"[PASS {pass_num}] Press ] in Terminal 1 to activate, wait 5s, press 9")
+                    print("=" * 60)
+                else:
+                    print("=" * 60)
+                    print(f"[PASS {pass_num}] Replaying to check for remaining collisions...")
+                    print(f"[PASS {pass_num}] Clean passes so far: {clean_passes}/{CLEAN_PASSES_REQUIRED}")
+                    print("=" * 60)
 
-            # Pass 2: loop with fixed trajectory
-            print("=" * 50)
-            print(f"[PASS 2] Playing fixed trajectory (loop={args.loop})...")
-            print("=" * 50)
-            _play_once("pass 2", do_loop=args.loop)
+                t0 = _play_once(label, do_loop=False)
+
+                # Read collision log and check
+                print("=" * 60)
+                print(f"[FIX] Reading collision log after pass {pass_num}...")
+                print("=" * 60)
+                fixed = fix_from_collision_log(
+                    dof_pos, fps=fps, speed=float(args.speed),
+                    t0_wall=t0, initial_pose_seconds=float(args.initial_pose_seconds),
+                )
+
+                if fixed == 0:
+                    clean_passes += 1
+                    print(f"[OK] Pass {pass_num} clean! ({clean_passes}/{CLEAN_PASSES_REQUIRED})")
+
+                    if clean_passes >= CLEAN_PASSES_REQUIRED:
+                        hardware_safe = True
+                        print("")
+                        print("=" * 60)
+                        print("  SAFE TO RUN ON HARDWARE")
+                        print(f"  {CLEAN_PASSES_REQUIRED} consecutive clean passes — zero self-collisions.")
+                        print(f"  Trajectory verified over {pass_num} passes.")
+                        print("=" * 60)
+                        print("")
+                        break
+                else:
+                    clean_passes = 0  # reset on any collision
+                    if src_dof_names_early:
+                        clamp_to_joint_limits(dof_pos, src_dof_names_early)
+                    print(f"[RETRY] Fixed {fixed} frames — clean pass counter reset to 0")
+
+            # Final phase: loop with the verified trajectory
+            if hardware_safe:
+                print("[LOOP] Playing verified collision-free trajectory...")
+            else:
+                print("[LOOP] Playing best-effort trajectory (not fully verified)...")
+            _play_once("loop", do_loop=args.loop)
         else:
             _play_once("play", do_loop=args.loop)
 
