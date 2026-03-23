@@ -344,7 +344,7 @@ def fix_from_collision_log(dof_pos: np.ndarray, fps: float, speed: float,
     import json
 
     if not Path(log_path).exists():
-        print(f"[warn] no collision log found at {log_path}")
+        print(f"[info] no collision log at {log_path} — no collisions occurred in pass 1")
         return 0
 
     # Read collision events
@@ -569,24 +569,40 @@ def main():
     rate = node.create_rate(args.teleop_frequency)
 
     def _play_once(label: str, do_loop: bool) -> float:
-        """Play through the trajectory. Returns wall-clock start time."""
+        """Play through the trajectory. Returns wall-clock start time (time.time())."""
         last_upper = np.zeros((28,), dtype=float)
         iteration = 0
-        t0_wall = time.time()
+        loop_count = 0
+        last_progress = -1
+        # time.time() for cross-process correlation with collision log
+        t0_wall_clock = time.time()
+        # time.monotonic() for ROS message timestamps (control loop expects monotonic)
+        t0_mono = time.monotonic()
 
         try:
             while ros_manager.ok():
-                t_now = time.time()
-                t_motion = (t_now - t0_wall) * float(args.speed)
+                t_mono = time.monotonic()
+                t_motion = (t_mono - t0_mono) * float(args.speed)
 
                 if t_motion >= duration:
                     if do_loop:
-                        t0_wall = t_now
+                        t0_mono = t_mono
                         t_motion = 0.0
                         iteration = 0
+                        loop_count += 1
+                        print(f"[{label}] loop {loop_count} complete, restarting...", flush=True)
                     else:
-                        print(f"[info] {label}: reached end of motion")
+                        print(f"[{label}] reached end of motion")
                         break
+
+                # Progress every 10%
+                pct = int(t_motion / duration * 100) // 10 * 10
+                if pct != last_progress and pct > 0:
+                    last_progress = pct
+                    frame = int(t_motion * fps)
+                    from datetime import datetime
+                    ts = datetime.now().strftime("%H:%M:%S")
+                    print(f"[{ts}] [{label}] {pct}% — {t_motion:.1f}s / {duration:.1f}s — frame {frame}/{T}", flush=True)
 
                 q_src = interp_dof_pos(dof_pos, fps=fps, t=t_motion)
 
@@ -600,12 +616,12 @@ def main():
                 last_upper = q_upper.copy()
 
                 if iteration == 0:
-                    target_time = t_now + float(args.initial_pose_seconds)
+                    target_time = t_mono + float(args.initial_pose_seconds)
                 else:
-                    target_time = t_now + (1.0 / float(args.teleop_frequency))
+                    target_time = t_mono + (1.0 / float(args.teleop_frequency))
 
                 msg = {
-                    "timestamp": t_now,
+                    "timestamp": t_mono,
                     "target_time": target_time,
                     "target_upper_body_pose": q_upper,
                 }
@@ -628,14 +644,13 @@ def main():
         except ros_manager.exceptions() as e:
             print(f"[info] {label}: interrupted: {e}")
 
-        return t0_wall
+        return t0_wall_clock
 
     try:
         if args.two_pass:
-            # Clear old collision log
             log_path = COLLISION_LOG_PATH
-            if Path(log_path).exists():
-                Path(log_path).unlink()
+            # Don't delete or truncate — sim may have the file open.
+            # We filter by timestamp in fix_from_collision_log instead.
 
             # Pass 1: play once, let sim record collisions
             print("=" * 50)
